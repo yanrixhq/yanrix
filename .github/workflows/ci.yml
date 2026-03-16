@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Explicit read-only default. All workflows in yanrixhq/yanrix must declare
+# permissions at the workflow level. Grant additional permissions per-job only
+# and only to the minimum required for that job's function.
+
+permissions:
+  contents: read
+
+jobs:
+  repo-health:
+    name: Repository health check
+    runs-on: ubuntu-latest
+
+    # Job-level permissions inherit workflow default (contents: read).
+    # No additional permissions required for this job.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Confirm repository structure
+        run: |
+          echo "yanrixhq/yanrix — repository health check"
+          echo "Verifying expected paths exist..."
+
+          required_paths=(
+            ".github/CODEOWNERS"
+            ".github/workflows/ci.yml"
+            "README.md"
+          )
+
+          all_present=true
+          for path in "${required_paths[@]}"; do
+            if [ -e "$path" ]; then
+              echo "  ✓ $path"
+            else
+              echo "  ✗ $path — MISSING"
+              all_present=false
+            fi
+          done
+
+          if [ "$all_present" = false ]; then
+            echo "One or more required paths are missing."
+            exit 1
+          fi
+
+          echo "All required paths present."
