@@ -1,0 +1,13 @@
+# yanrixhq/yanrix — CODEOWNERS
+# All paths require engineering review.
+# Workflow and ownership files additionally require security review.
+# Teams must have explicit repository access for rules to be honored.
+
+# Default — all files
+* @yanrixhq/engineering
+
+# GitHub Actions workflows
+.github/workflows/ @yanrixhq/engineering @yanrixhq/security
+
+# CODEOWNERS itself
+.github/CODEOWNERS @yanrixhq/engineering @yanrixhq/security
