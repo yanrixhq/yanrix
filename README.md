@@ -48,19 +48,32 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  actions: read
 
 jobs:
   threat-model:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+      
+      ## Comment out before using Gemini model
       - uses: yanrixhq/yanrix@v1
+        with:
+          model: "anthropic/claude-sonnet-4"
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    
+     # Uncomment to use Gemini instead
+     # - uses: yanrixhq/yanrix@v1
+     #   with:
+     #     model: "gemini/gemini-2.5-pro"
+     #     # target_folder: "docs"
+     #   env:
+     #     GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    
 ```
 
-This default configuration uses Anthropic Claude and scans your entire repository. See [Configuration](#configuration) for additional options.
+This default configuration uses Anthropic Claude and scans your entire repository.
 
 ### 3. Configure your LLM API key
 
@@ -72,7 +85,7 @@ Add your API key as a repository secret. In your repository, go to **Settings** 
 | OpenAI | `OPENAI_API_KEY` | Starts with `sk-` |
 | Google Gemini | `GEMINI_API_KEY` | Alphanumeric string |
 
-Only configure the secret for the provider you are using. See the [BYOK Configuration Guide](https://yanrix.dev/docs/byok) for step-by-step instructions on obtaining a key, minimum required API key scopes, and spend cap recommendations for each provider.
+Only configure the secret for the provider you are using.
 
 ### 4. Open a pull request
 
@@ -168,7 +181,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
-When triggered manually from the Actions tab, the PDF report and threat model manifest are uploaded as workflow artifacts. See the [Yanrix documentation](https://yanrix.dev/docs) for additional configuration options and advanced workflows.
+When triggered manually from the Actions tab, the PDF report and threat model manifest are uploaded as workflow artifacts.
 
 ## How it works
 
@@ -227,8 +240,6 @@ This is the analysis that traditionally happens in a whiteboard session or a des
 
 ## Documentation
 
-- [Getting Started](https://yanrix.dev/docs/getting-started) — Full setup walkthrough with detailed explanations
-- [BYOK Configuration Guide](https://yanrix.dev/docs/byok) — API key setup, minimum scopes, and spend cap guidance per provider
 - [Privacy Policy](https://yanrix.dev/privacy)
 
 ## Support
