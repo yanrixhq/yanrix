@@ -22,7 +22,7 @@
 #
 # =============================================================================
 
-name: 'Yanrix'
+name: 'Yanrix Security'
 description: 'Continuous STRIDE threat modeling on every pull request'
 branding:
   icon: 'shield'
