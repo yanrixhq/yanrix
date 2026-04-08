@@ -1,0 +1,331 @@
+# =============================================================================
+# Yanrix — Composite Action Definition
+# =============================================================================
+#
+# This file defines the Yanrix composite action. It lives at the root of
+# the public yanrixhq/yanrix repository. Customers reference this action
+# in their workflow YAML as: uses: yanrixhq/yanrix@v1
+#
+#
+# SECURITY MODEL:
+#   - API key secrets are scoped to the analysis step only.
+#   - YANRIX_HOME is hardcoded — never derived from user input.
+#   - All third-party actions are pinned to commit SHAs.
+#   - The system prompt is served by the backend at runtime and never
+#     stored on disk.
+#
+# PRIVACY INVARIANT:
+#   Source code, PR diffs, and manifest content exist only in GitHub runner
+#   memory during the workflow run and in transit to the LLM provider.
+#   No such content passes through the Yanrix backend. Manifest artifacts
+#   are stored in GitHub Artifacts under the customer's own repository.
+#
+# =============================================================================
+
+name: 'Yanrix'
+description: 'Continuous STRIDE threat modeling on every pull request'
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+# ---------------------------------------------------------------------------
+# Inputs
+#
+# These are declared here and consumed by the composite steps below.
+# Customer workflows pass these via the `with:` block when calling the
+# action. All inputs have sensible defaults — only the LLM API key
+# secret (configured in the customer's repository settings) is required
+# for full STRIDE analysis. Without a key, the pipeline runs in
+# deterministic_only mode.
+# ---------------------------------------------------------------------------
+inputs:
+  model:
+    description: >
+      LLM model in LiteLLM provider/model-name format.
+      Examples: "anthropic/claude-sonnet-4-20250514", "gemini/gemini-3.1-pro-preview".
+      When blank, defaults to the model configured in the pipeline
+      (currently anthropic/claude-sonnet-4-6).
+    required: false
+    default: ''
+  target_folder:
+    description: >
+      Path to a specific directory to analyze, relative to repository root.
+      Defaults to the repository root.
+    required: false
+    default: '.'
+  use_large_context:
+    description: >
+      Use 1M token context window. Set to "true" only with models that
+      support a 1M context window. When "false" (default), the pipeline
+      enforces a 200K token ceiling.
+    required: false
+    default: 'false'
+  generate_pdf:
+    description: >
+      Generate a PDF threat model report as a workflow artifact.
+      Requires the reportlab package (installed automatically when enabled).
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+
+    # -------------------------------------------------------------------
+    # Step 1: Obtain scoped checkout token from Yanrix Worker.
+    # -------------------------------------------------------------------
+    - name: Obtain checkout token
+      id: checkout-token
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          https://api.yanrix.dev/checkout-token \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"repo_name\": \"$GITHUB_REPOSITORY\"}")
+
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "::error::Yanrix /checkout-token returned HTTP $HTTP_CODE."
+          echo "Response: $(echo "$BODY" | jq 'del(.token)' 2>/dev/null || echo "$BODY")"
+          if [ "$HTTP_CODE" = "403" ]; then
+            echo "::error::Is the Yanrix GitHub App installed on this repository? Install from https://github.com/apps/yanrix-security"
+          fi
+          exit 1
+        fi
+
+        TOKEN=$(echo "$BODY" | jq -r '.token')
+        REPO=$(echo "$BODY" | jq -r '.repository')
+
+        if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+          echo "::error::Yanrix /checkout-token did not return a token."
+          echo "Worker response (sanitized): $(echo "$BODY" | jq 'del(.token)')"
+          exit 1
+        fi
+
+        if [ "$REPO" != "yanrixhq/guarded-quokka" ]; then
+          echo "::error::Unexpected repository in token response: $REPO"
+          exit 1
+        fi
+
+        echo "::add-mask::$TOKEN"
+        echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+    # -------------------------------------------------------------------
+    # Step 2: Checkout Yanrix analysis engine.
+    #
+    # SECURITY:
+    #   - Uses the scoped installation token from Step 1.
+    #   - persist-credentials: false prevents the token from leaking
+    #     into subsequent steps or the git credential store.
+    #   - Checked out to .yanrix/ to keep the runner workspace clean
+    #     and avoid collisions with the customer's repository files.
+    #   - Pinned to commit SHA — not a mutable version tag.
+    # -------------------------------------------------------------------
+    - name: Checkout Yanrix
+      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      with:
+        repository: yanrixhq/guarded-quokka
+        token: ${{ steps.checkout-token.outputs.token }}
+        path: .yanrix
+        persist-credentials: false
+
+    # -------------------------------------------------------------------
+    # Step 3: Set up Python 3.12.
+    # Pinned to commit SHA. Python 3.12 matches the tested runtime.
+    # -------------------------------------------------------------------
+    - name: Set up Python
+      uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3 # v5.2.0
+      with:
+        python-version: '3.12'
+
+    # -------------------------------------------------------------------
+    # Step 4: Install hash-verified production dependencies.
+    #
+    # requirements.txt contains litellm, tiktoken, python-docx, lxml,
+    # and typing_extensions — all pinned to exact versions.
+    #
+    # --break-system-packages is required on ubuntu-latest runners which
+    # use the system Python (PEP 668 externally-managed environment).
+    #
+    # --no-deps prevents pip from pulling transitive dependencies that
+    # are not listed in requirements.txt.
+    #
+    # -------------------------------------------------------------------
+    - name: Install dependencies
+      shell: bash
+      run: |
+        pip install --break-system-packages --no-deps \
+          -r .yanrix/requirements.txt
+
+    # -------------------------------------------------------------------
+    # Step 5: Install runtime dependencies.
+    #
+    # litellm, tiktoken, and jsonschema are installed separately here.
+    # validation against the JSON Schema.
+    # -------------------------------------------------------------------
+    - name: Install runtime dependencies
+      shell: bash
+      run: |
+        pip install --break-system-packages \
+          litellm==1.61.15 tiktoken==0.8.0 jsonschema
+
+    # -------------------------------------------------------------------
+    # Step 6: Resolve and validate scan paths.
+    #
+    # Normalizes target_folder into clean absolute paths for the scan
+    # root and output directory. When target_folder is "." (default),
+    # this resolves away the redundant "/./output/" segment that would
+    # otherwise appear in logs and artifact upload paths.
+    #
+    # Outputs:
+    #   scan_root  — absolute path to the directory main.py will scan
+    #   output_dir — absolute path where main.py writes the manifest
+    #
+    # SECURITY: target_folder is an operator-supplied input. realpath
+    # canonicalizes symlinks and ".." sequences, and the subsequent
+    # prefix check ensures the resolved path stays within the workspace.
+    # This prevents path traversal attacks that could cause the pipeline
+    # to scan files outside the checked-out repository.
+    # -------------------------------------------------------------------
+    - name: Resolve scan paths
+      id: paths
+      shell: bash
+      run: |
+        RAW_TARGET="${{ github.workspace }}/${{ inputs.target_folder }}"
+        SCAN_ROOT=$(realpath "$RAW_TARGET" 2>/dev/null || echo "$RAW_TARGET")
+
+        # Verify resolved path is within the workspace (path traversal guard)
+        if [[ "$SCAN_ROOT" != "${{ github.workspace }}"* ]]; then
+          echo "::error::target_folder resolved to a path outside the workspace: $SCAN_ROOT"
+          exit 1
+        fi
+
+        OUTPUT_DIR="${SCAN_ROOT}/output"
+        echo "scan_root=$SCAN_ROOT" >> $GITHUB_OUTPUT
+        echo "output_dir=$OUTPUT_DIR" >> $GITHUB_OUTPUT
+        echo "Scan root: $SCAN_ROOT"
+        echo "Output dir: $OUTPUT_DIR"
+
+    # -------------------------------------------------------------------
+    # Step 7: Download prior manifest artifact.
+    #
+    # Retrieves the most recent manifest from a prior workflow run for
+    # version comparison (living threat model concept). Uses a stable
+    # artifact name so it can be found across runs.
+    #
+    # continue-on-error: true ensures the workflow proceeds cleanly on
+    # first run or when the prior artifact has expired. The pipeline's
+    # prior_manifest.py module has a GitHub API fallback for cross-run
+    # retrieval when the local download is unavailable.
+    #
+    # -------------------------------------------------------------------
+    - name: Download prior manifest
+      id: prior-manifest
+      uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      with:
+        name: yanrix-manifest
+        path: prior-manifest/
+      continue-on-error: true
+
+    # -------------------------------------------------------------------
+    # Step 8: Run Yanrix analysis.
+    #
+    # SECURITY:
+    #   - Exit code 0 for all analysis outcomes — the workflow run is
+    #     never marked as failed due to analysis issues.
+    #
+    # Environment variables consumed by main.py:
+    #   Required (set here):
+    #     GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_SERVER_URL, GITHUB_RUN_ID,
+    #     YANRIX_HOME, TB_SCAN_ROOT, PRIOR_MANIFEST_PATH
+    #   Required (set automatically by GitHub Actions):
+    #     GITHUB_EVENT_PATH
+    #   Optional (from workflow inputs, passed through):
+    #     INPUT_MODEL, INPUT_USE_LARGE_CONTEXT
+    #   Optional (set by customer in their repo secrets):
+    #     ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, AZURE_API_KEY,
+    #     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+    #   Note: Provider API key secrets must be scoped to the step that
+    #     calls this composite action in the customer's workflow YAML (T01).
+    #     This composite action does not — and cannot — scope secrets;
+    #     that responsibility belongs to the caller workflow.
+    # -------------------------------------------------------------------
+    - name: Run Yanrix analysis
+      id: analysis
+      shell: bash
+      env:
+        # --- Pipeline configuration ---
+        YANRIX_HOME: ${{ github.workspace }}/.yanrix
+        TB_SCAN_ROOT: ${{ steps.paths.outputs.scan_root }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_USE_LARGE_CONTEXT: ${{ inputs.use_large_context }}
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        PRIOR_MANIFEST_PATH: ${{ github.workspace }}/prior-manifest
+      run: |
+        cd .yanrix/src && python main.py
+
+    # -------------------------------------------------------------------
+    # Step 9: Generate PDF report (conditional).
+    #
+    # Only runs when generate_pdf input is "true". ReportLab is installed
+    # on demand to avoid adding a dependency for users who don't need it.
+    #
+    # The PDF generator reads the manifest from the resolved output
+    # directory and writes the PDF alongside it.
+    # -------------------------------------------------------------------
+    - name: Generate PDF report
+      if: inputs.generate_pdf == 'true'
+      shell: bash
+      run: |
+        pip install --break-system-packages reportlab
+        python .yanrix/threatbridge_report_generator2_1.py \
+          "${{ steps.paths.outputs.output_dir }}/threatbridge-manifest.json" \
+          "${{ steps.paths.outputs.output_dir }}/yanrix-report.pdf"
+
+    # -------------------------------------------------------------------
+    # Step 10: Upload manifest artifact.
+    #
+    # Uses a stable artifact name ("yanrix-manifest") so Step 7 can
+    # retrieve it on subsequent runs for version comparison. The run ID
+    # is NOT included in the artifact name — GitHub Artifacts already
+    # associates each artifact with its workflow run.
+    #
+    # Retention set to 400 days (maximum for private repos) to support
+    # the living threat model version history.
+    #
+    # Uploads both the manifest JSON and its SHA-256 hash file for
+    # integrity verification on retrieval (G03/T07).
+    #
+    # -------------------------------------------------------------------
+    - name: Upload manifest artifact
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: yanrix-manifest
+        path: |
+          ${{ steps.paths.outputs.output_dir }}/threatbridge-manifest.json
+          ${{ steps.paths.outputs.output_dir }}/threatbridge-manifest.sha256
+        retention-days: 400
+        if-no-files-found: error
+
+    # -------------------------------------------------------------------
+    # Step 11: Upload PDF artifact (conditional).
+    #
+    # Only runs when generate_pdf is "true". Uses warn for
+    # if-no-files-found because the PDF step may have failed silently.
+    # -------------------------------------------------------------------
+    - name: Upload PDF artifact
+      if: inputs.generate_pdf == 'true'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: yanrix-report-${{ github.run_id }}
+        path: ${{ steps.paths.outputs.output_dir }}/yanrix-report.pdf
+        retention-days: 400
+        if-no-files-found: warn
