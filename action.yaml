@@ -287,7 +287,7 @@ runs:
       run: |
         pip install --break-system-packages reportlab
         python .yanrix/threatbridge_report_generator2_1.py \
-          "${{ steps.paths.outputs.output_dir }}/threatbridge-manifest.json" \
+          "${{ steps.paths.outputs.output_dir }}/yanrix-manifest.json" \
           "${{ steps.paths.outputs.output_dir }}/yanrix-report.pdf"
 
     # -------------------------------------------------------------------
@@ -310,8 +310,8 @@ runs:
       with:
         name: yanrix-manifest
         path: |
-          ${{ steps.paths.outputs.output_dir }}/threatbridge-manifest.json
-          ${{ steps.paths.outputs.output_dir }}/threatbridge-manifest.sha256
+          ${{ steps.paths.outputs.output_dir }}/yanrix-manifest.json
+          ${{ steps.paths.outputs.output_dir }}/yanrix-manifest.sha256
         retention-days: 400
         if-no-files-found: error
 
